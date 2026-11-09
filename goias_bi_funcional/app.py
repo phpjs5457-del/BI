@@ -1,4 +1,6 @@
+import json
 import sqlite3
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -6,6 +8,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import requests
 
 BASE = Path(__file__).resolve().parent
 BANCO = BASE / 'saida' / 'goias_bi.db'
@@ -71,7 +74,7 @@ def grafico_claro(fig):
     fig.update_yaxes(gridcolor='#E5EEE8', zerolinecolor='#E5EEE8')
     return fig
 
-visao, analise, dados = st.tabs(['📊 Visão geral', '📈 Correlação e regressão', '🗂️ Dados e metodologia'])
+visao, analise, mapa, dados = st.tabs(['📊 Visão geral', '📈 Correlação e regressão', '🗺️ Mapa de Goiás', '🗂️ Dados e metodologia'])
 with visao:
     m1,m2,m3=st.columns(3)
     m1.metric('Municípios selecionados', f'{len(filtrado)} de {len(df)}')
@@ -112,6 +115,106 @@ with analise:
         valor=st.number_input('Valor de IPVA repassado (R$)',min_value=0.0,value=float(np.median(x)),step=10000.0,format='%.2f')
         st.metric('ICMS estimado pelo modelo',reais(b+a*valor))
         st.caption('Estimativa descritiva, não previsão oficial. Evite extrapolar para valores fora dos observados.')
+
+
+# A planilha fiscal usa códigos próprios, diferentes dos códigos IBGE.
+# O vínculo geográfico é realizado pelo nome normalizado do município.
+FONTE_GEOJSON = 'https://cdn.jsdelivr.net/gh/henriquemalvar/br-geojson@main/dist/municipios/GO.geojson'
+ARQUIVO_GEOJSON = BASE / 'dados' / 'goias_municipios.geojson'
+
+
+def normalizar_municipio(valor):
+    texto = unicodedata.normalize('NFKD', str(valor or ''))
+    texto = ''.join(c for c in texto if not unicodedata.combining(c))
+    return ' '.join(texto.casefold().strip().split())
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def carregar_geojson():
+    if ARQUIVO_GEOJSON.exists():
+        with ARQUIVO_GEOJSON.open(encoding='utf-8') as arquivo:
+            geo = json.load(arquivo)
+    else:
+        resposta = requests.get(FONTE_GEOJSON, timeout=30)
+        resposta.raise_for_status()
+        geo = resposta.json()
+        if geo.get('type') != 'FeatureCollection':
+            raise ValueError('A fonte do mapa não retornou um GeoJSON válido.')
+        ARQUIVO_GEOJSON.parent.mkdir(parents=True, exist_ok=True)
+        ARQUIVO_GEOJSON.write_text(json.dumps(geo, ensure_ascii=False), encoding='utf-8')
+    if geo.get('type') != 'FeatureCollection' or not geo.get('features'):
+        raise ValueError('Arquivo GeoJSON inválido ou sem municípios.')
+    return geo
+
+
+with mapa:
+    st.subheader('Distribuição territorial dos repasses em Goiás')
+    st.caption('Mapa municipal de 2025 · Passe o mouse sobre um município para ver os repasses. Os filtros da barra lateral também se aplicam ao mapa.')
+    indicador = st.selectbox(
+        'Indicador geográfico',
+        options=['icms_repassado', 'ipva_repassado'],
+        format_func=lambda nome: 'ICMS repassado (R$)' if nome == 'icms_repassado' else 'IPVA repassado (R$)',
+    )
+    try:
+        geometria = carregar_geojson()
+    except (OSError, ValueError, requests.RequestException, json.JSONDecodeError) as erro:
+        st.error('Não foi possível carregar a malha municipal. Confira sua internet ou salve o arquivo goias_municipios.geojson na pasta dados.')
+        st.caption(f'Detalhes técnicos: {erro}')
+        st.code('python baixar_mapa.py', language='bash')
+    else:
+        registros_mapa = []
+        for feature in geometria['features']:
+            propriedades = feature.get('properties') or {}
+            nome = propriedades.get('nome') or propriedades.get('NM_MUN')
+            codigo = propriedades.get('cd_geocmu') or propriedades.get('CD_MUN')
+            if nome and codigo:
+                registros_mapa.append({'nome_geo': str(nome), 'chave': normalizar_municipio(nome), 'ibge_id': str(codigo)})
+        tabela_geo = pd.DataFrame(registros_mapa)
+        if tabela_geo.empty or tabela_geo['chave'].duplicated().any():
+            st.error('A malha municipal não possui nomes/códigos válidos e únicos para cruzamento.')
+        else:
+            tabela_fiscal = filtrado.copy()
+            tabela_fiscal['chave'] = tabela_fiscal['municipio'].map(normalizar_municipio)
+            associados = tabela_fiscal.merge(tabela_geo, on='chave', how='left', validate='one_to_one')
+            nao_localizados = associados[associados['ibge_id'].isna()]
+            associados = associados.dropna(subset=['ibge_id']).copy()
+            col1, col2, col3 = st.columns(3)
+            col1.metric('Municípios com geometria', f'{len(associados)} de {len(filtrado)}')
+            col2.metric('ICMS no mapa', reais(associados['icms_repassado'].sum()))
+            col3.metric('IPVA no mapa', reais(associados['ipva_repassado'].sum()))
+            if not nao_localizados.empty:
+                with st.expander(f'{len(nao_localizados)} município(s) sem correspondência no mapa'):
+                    st.dataframe(nao_localizados[['municipio', 'codigo_municipio']], hide_index=True)
+            if associados.empty:
+                st.warning('Nenhum município selecionado corresponde à malha. Confira os nomes da base.')
+            else:
+                nome_indicador = 'ICMS repassado (R$)' if indicador == 'icms_repassado' else 'IPVA repassado (R$)'
+                figura_mapa = px.choropleth(
+                    associados,
+                    geojson=geometria,
+                    locations='ibge_id',
+                    featureidkey='properties.cd_geocmu',
+                    color=indicador,
+                    hover_name='municipio',
+                    hover_data={
+                        'ibge_id': False,
+                        'codigo_municipio': True,
+                        'icms_repassado': ':,.2f',
+                        'ipva_repassado': ':,.2f',
+                    },
+                    color_continuous_scale=[[0, '#E7F5E8'], [0.35, '#8BCB93'], [0.7, '#269653'], [1, '#075A32']],
+                    labels={indicador: nome_indicador, 'codigo_municipio': 'Código fiscal',
+                            'icms_repassado': 'ICMS (R$)', 'ipva_repassado': 'IPVA (R$)'},
+                )
+                figura_mapa.update_geos(fitbounds='locations', visible=False, bgcolor='rgba(0,0,0,0)')
+                figura_mapa.update_layout(
+                    template='plotly_white', height=680, dragmode=False,
+                    margin=dict(l=0, r=0, t=0, b=0),
+                    paper_bgcolor='#FFFFFF',
+                    coloraxis_colorbar=dict(title='R$', tickformat=',.0f'),
+                )
+                st.plotly_chart(figura_mapa, use_container_width=True)
+                st.caption('Fonte geográfica: malha municipal derivada do IBGE, disponibilizada em GeoJSON pelo projeto br-geojson. O código municipal fiscal é distinto do geocódigo IBGE; os vínculos foram feitos pelo nome do município.')
 
 with dados:
     st.subheader('Base municipal consolidada')
