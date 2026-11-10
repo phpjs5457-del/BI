@@ -1,3 +1,5 @@
+import base64
+import html
 import json
 import sqlite3
 import unicodedata
@@ -37,13 +39,17 @@ h1,h2,h3 {color:#145D35!important;letter-spacing:-.025em}
 .go-title {font-size:clamp(28px,3vw,42px);font-weight:850;color:#145D35;line-height:1.1;margin:8px 0}
 .go-sub {color:#526d5c;font-size:15px}
 .go-accent {height:5px;max-width:180px;border-radius:8px;background:linear-gradient(to right,#16713C 0 45%,#F3C543 45% 75%,#19549B 75%)}
+.go-motion {width:112px;height:112px;object-fit:contain;filter:drop-shadow(0 5px 12px #16713c20)}
 </style>''', unsafe_allow_html=True)
 
-bandeira, cabecalho = st.columns([1, 7], vertical_alignment='center')
+bandeira, cabecalho, animacao = st.columns([1, 7, 1.15], vertical_alignment='center')
 with bandeira:
     st.image('https://commons.wikimedia.org/wiki/Special:FilePath/Flag_of_Goi%C3%A1s.svg', width=112)
 with cabecalho:
     st.markdown('''<div class="go-hero"><div class="go-eyebrow">Estado de Goiás · Business Intelligence</div><div class="go-title">Goiás BI | Inteligência Fiscal</div><div class="go-sub">Painel de repasses municipais de ICMS e IPVA · Exercício 2025</div><div class="go-accent" style="margin-top:14px"></div></div>''', unsafe_allow_html=True)
+with animacao:
+    gif = base64.b64encode((BASE / 'assets' / 'goias_bi_animado.gif').read_bytes()).decode('ascii')
+    st.markdown(f'<img class="go-motion" src="data:image/gif;base64,{gif}" alt="Mapa de Goiás com animação de dados em movimento">', unsafe_allow_html=True)
 
 st.info('Análise exploratória: ICMS e IPVA vêm de abas da mesma planilha. Para cumprir integralmente a atividade, ainda é necessária uma segunda base pública independente.')
 if not BANCO.exists():
@@ -129,6 +135,133 @@ def normalizar_municipio(valor):
     return ' '.join(texto.casefold().strip().split())
 
 
+def criar_mapa_svg(geometria, associados, indicador):
+    features_por_codigo = {
+        str(feature.get('properties', {}).get('cd_geocmu') or feature.get('properties', {}).get('CD_MUN')): feature
+        for feature in geometria['features']
+    }
+    selecionados = associados.set_index('ibge_id').to_dict('index')
+    valores = associados[indicador].dropna().astype(float)
+    cores = ['#E6F4E9', '#BDE2C5', '#82C996', '#3FA867', '#116B3A']
+    limites = np.unique(valores.quantile(np.linspace(0, 1, len(cores) + 1)).to_numpy())
+    classes = {
+        codigo: (
+            0 if len(limites) == 1
+            else int(np.searchsorted(limites[1:-1], float(municipio[indicador]), side='left'))
+        )
+        for codigo, municipio in selecionados.items()
+        if pd.notna(municipio[indicador])
+    }
+
+    def rings_for(feature):
+        if feature['geometry']['type'] == 'Polygon':
+            return feature['geometry']['coordinates']
+        return [ring for poligono in feature['geometry']['coordinates'] for ring in poligono]
+
+    pontos_originais = [
+        ponto
+        for feature in geometria['features']
+        for ring in rings_for(feature)
+        for ponto in ring
+    ]
+    latitude_media = np.mean([ponto[1] for ponto in pontos_originais])
+    fator_longitude = np.cos(np.radians(latitude_media))
+    pontos = [
+        (ponto[0] * fator_longitude, ponto[1])
+        for ponto in pontos_originais
+    ]
+    min_x = min(ponto[0] for ponto in pontos)
+    max_x = max(ponto[0] for ponto in pontos)
+    min_y = min(ponto[1] for ponto in pontos)
+    max_y = max(ponto[1] for ponto in pontos)
+    largura, altura_mapa, margem = 900, 690, 24
+    altura_legenda = 170
+    altura = altura_mapa + altura_legenda
+    escala = min((largura - margem * 2) / (max_x - min_x), (altura_mapa - margem * 2) / (max_y - min_y))
+    deslocamento_x = (largura - (max_x - min_x) * escala) / 2
+    deslocamento_y = (altura_mapa - (max_y - min_y) * escala) / 2
+
+    def projetar(ponto):
+        x = deslocamento_x + (ponto[0] * fator_longitude - min_x) * escala
+        y = altura_mapa - deslocamento_y - (ponto[1] - min_y) * escala
+        return x, y
+
+    caminhos = []
+    for codigo, feature in features_por_codigo.items():
+        municipio = selecionados.get(codigo)
+        valor = float(municipio[indicador]) if municipio and pd.notna(municipio[indicador]) else None
+        faixa = classes.get(codigo) if valor is not None else None
+        cor = cores[faixa] if faixa is not None else '#E8ECE9'
+        segmentos = []
+        for ring in rings_for(feature):
+            projetados = [projetar(ponto) for ponto in ring]
+            segmentos.append(
+                'M' + 'L'.join(f'{x:.1f},{y:.1f}' for x, y in projetados) + 'Z'
+            )
+        nome = municipio['municipio'] if municipio else feature.get('properties', {}).get('nome', 'Município')
+        descricao = f'{nome} — {reais(valor)}' if valor is not None else f'{nome} — fora do filtro'
+        caminhos.append(
+            f'<path class="municipio" d="{"".join(segmentos)}" fill="{cor}" '
+            f'title="{html.escape(descricao, quote=True)}"><title>{html.escape(descricao)}</title></path>'
+        )
+
+    def formatar_limite(valor):
+        absoluto = abs(valor)
+        divisor, sufixo = (1_000_000, ' mi') if absoluto >= 1_000_000 else (
+            (1_000, ' mil') if absoluto >= 1_000 else (1, '')
+        )
+        numero = f'{valor / divisor:,.1f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+        return f'{numero}{sufixo}'
+
+    itens_legenda = []
+    quantidade_faixas = max(1, len(limites) - 1)
+    for indice in range(quantidade_faixas):
+        cor = cores[indice]
+        if len(limites) == 1:
+            intervalo = f'{formatar_limite(limites[0])} (todos iguais)'
+        elif indice == 0:
+            intervalo = f'Até {formatar_limite(limites[1])}'
+        else:
+            intervalo = f'Acima de {formatar_limite(limites[indice])} até {formatar_limite(limites[indice + 1])}'
+        x = 24 + (indice % 3) * 292
+        y = altura_mapa + 78 + (indice // 3) * 42
+        itens_legenda.append(
+            f'<rect x="{x}" y="{y - 13}" width="17" height="17" rx="4" fill="{cor}"/>'
+            f'<text x="{x + 25}" y="{y}" class="legenda-titulo">Faixa {indice + 1}</text>'
+            f'<text x="{x + 25}" y="{y + 16}" class="legenda-valor">{html.escape(intervalo)}</text>'
+        )
+    x_fora = 24 + (quantidade_faixas % 3) * 292
+    y_fora = altura_mapa + 78 + (quantidade_faixas // 3) * 42
+    itens_legenda.append(
+        f'<rect x="{x_fora}" y="{y_fora - 13}" width="17" height="17" rx="4" fill="#E8ECE9"/>'
+        f'<text x="{x_fora + 25}" y="{y_fora}" class="legenda-titulo">Fora do filtro</text>'
+        f'<text x="{x_fora + 25}" y="{y_fora + 16}" class="legenda-valor">Municípios não selecionados</text>'
+    )
+    titulo_indicador = 'ICMS repassado' if indicador == 'icms_repassado' else 'IPVA repassado'
+    legenda = (
+        f'<rect x="0" y="{altura_mapa}" width="{largura}" height="{altura_legenda}" fill="#F8FBF9"/>'
+        f'<path d="M24 {altura_mapa + 15}H{largura - 24}" stroke="#DDEAE0"/>'
+        f'<text x="24" y="{altura_mapa + 43}" class="legenda-cabecalho">'
+        f'Legenda — {titulo_indicador} (R$)</text>'
+        f'<text x="24" y="{altura_mapa + 62}" class="legenda-nota">'
+        'Faixas por quintis dos municípios selecionados · valores resumidos em mil ou milhões</text>'
+        f'{"".join(itens_legenda)}'
+    )
+
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {largura} {altura}" '
+        f'role="img" aria-label="Mapa de Goiás dividido em municípios, colorido por {html.escape(indicador)}" '
+        'style="display:block;width:100%;height:auto">'
+        '<style>.municipio{stroke:#fff;stroke-width:1.05;stroke-linejoin:round;vector-effect:non-scaling-stroke;'
+        'transition:fill .15s,stroke-width .15s}.municipio:hover{stroke:#123f29;stroke-width:2.6}'
+        '.legenda-cabecalho{font:700 17px sans-serif;fill:#145D35}'
+        '.legenda-nota{font:12px sans-serif;fill:#526d5c}'
+        '.legenda-titulo{font:700 12px sans-serif;fill:#244936}'
+        '.legenda-valor{font:11px sans-serif;fill:#526d5c}</style>'
+        f'{"".join(caminhos)}{legenda}</svg>'
+    )
+
+
 @st.cache_data(show_spinner=False, ttl=86400)
 def carregar_geojson():
     if ARQUIVO_GEOJSON.exists():
@@ -173,11 +306,14 @@ with mapa:
         if tabela_geo.empty or tabela_geo['chave'].duplicated().any():
             st.error('A malha municipal não possui nomes/códigos válidos e únicos para cruzamento.')
         else:
-            tabela_fiscal = filtrado.copy()
+            tabela_fiscal = df.copy()
             tabela_fiscal['chave'] = tabela_fiscal['municipio'].map(normalizar_municipio)
-            associados = tabela_fiscal.merge(tabela_geo, on='chave', how='left', validate='one_to_one')
-            nao_localizados = associados[associados['ibge_id'].isna()]
-            associados = associados.dropna(subset=['ibge_id']).copy()
+            todos_associados = tabela_fiscal.merge(tabela_geo, on='chave', how='left', validate='one_to_one')
+            nao_localizados = todos_associados[
+                todos_associados['municipio'].isin(municipios) & todos_associados['ibge_id'].isna()
+            ]
+            todos_associados = todos_associados.dropna(subset=['ibge_id']).copy()
+            associados = todos_associados[todos_associados['municipio'].isin(municipios)].copy()
             col1, col2, col3 = st.columns(3)
             col1.metric('Municípios com geometria', f'{len(associados)} de {len(filtrado)}')
             col2.metric('ICMS no mapa', reais(associados['icms_repassado'].sum()))
@@ -188,32 +324,16 @@ with mapa:
             if associados.empty:
                 st.warning('Nenhum município selecionado corresponde à malha. Confira os nomes da base.')
             else:
-                nome_indicador = 'ICMS repassado (R$)' if indicador == 'icms_repassado' else 'IPVA repassado (R$)'
-                figura_mapa = px.choropleth(
-                    associados,
-                    geojson=geometria,
-                    locations='ibge_id',
-                    featureidkey='properties.cd_geocmu',
-                    color=indicador,
-                    hover_name='municipio',
-                    hover_data={
-                        'ibge_id': False,
-                        'codigo_municipio': True,
-                        'icms_repassado': ':,.2f',
-                        'ipva_repassado': ':,.2f',
-                    },
-                    color_continuous_scale=[[0, '#E7F5E8'], [0.35, '#8BCB93'], [0.7, '#269653'], [1, '#075A32']],
-                    labels={indicador: nome_indicador, 'codigo_municipio': 'Código fiscal',
-                            'icms_repassado': 'ICMS (R$)', 'ipva_repassado': 'IPVA (R$)'},
+                st.components.v1.html(
+                    criar_mapa_svg(geometria, associados, indicador),
+                    height=860,
+                    scrolling=False,
                 )
-                figura_mapa.update_geos(fitbounds='locations', visible=False, bgcolor='rgba(0,0,0,0)')
-                figura_mapa.update_layout(
-                    template='plotly_white', height=680, dragmode=False,
-                    margin=dict(l=0, r=0, t=0, b=0),
-                    paper_bgcolor='#FFFFFF',
-                    coloraxis_colorbar=dict(title='R$', tickformat=',.0f'),
+                st.caption(
+                    f'Exibindo {len(associados)} município(s) selecionado(s) de {len(todos_associados)} '
+                    'com geometria. Os demais municípios aparecem em cinza. Passe o mouse sobre uma área '
+                    'para consultar o município e o valor.'
                 )
-                st.plotly_chart(figura_mapa, use_container_width=True)
                 st.caption('Fonte geográfica: malha municipal derivada do IBGE, disponibilizada em GeoJSON pelo projeto br-geojson. O código municipal fiscal é distinto do geocódigo IBGE; os vínculos foram feitos pelo nome do município.')
 
 with dados:
